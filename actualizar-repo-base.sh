@@ -4,11 +4,10 @@
 # Aplica actualizaciones incrementales a un repo base YA creado y commiteado.
 # Se ejecuta DESDE la raíz del repo:  bash actualizar-repo-base.sh
 #
-# Esta versión agrega:
-#   - Hook UserPromptSubmit: rama git automática (propose/<id>-<timestamp>)
-#     en cada /opsx:propose.
-#   - Registro del hook en .claude/settings.json (merge no destructivo:
-#     respeta hooks/config existentes y es idempotente).
+# Actualizaciones incluidas (idempotentes, no destructivas):
+#   1. Hook /opsx:propose  → crea rama propose/<id>-<timestamp>
+#   2. Hook /opsx:archive  → al terminar el archive, git add -A + commit
+#      con mensaje relacionado al cambio de la rama.
 #
 # Requiere: bun y git.
 # ============================================================================
@@ -21,14 +20,27 @@ git rev-parse --show-toplevel >/dev/null 2>&1 || { echo "ERROR: ejecuta este scr
 [ -d openspec ] || { echo "ERROR: no veo la carpeta openspec/ — ¿es este el repo del tutorial?"; exit 1; }
 
 CAMBIOS=0
-
-# ============================================================================
-# 1. Hook: rama git automática en cada /opsx:propose
-# ============================================================================
 mkdir -p .claude/hooks
 
-HOOK=.claude/hooks/rama-propose.sh
-cat > "$HOOK.nuevo" << 'EOF'
+# Escribe un hook solo si es nuevo o cambió (mantiene idempotencia).
+instalar_hook() { # $1=ruta destino  (contenido por stdin)
+  local destino="$1"
+  cat > "$destino.nuevo"
+  if [ ! -f "$destino" ] || ! cmp -s "$destino.nuevo" "$destino"; then
+    mv "$destino.nuevo" "$destino"
+    chmod +x "$destino"
+    echo "==> Hook actualizado: $destino"
+    CAMBIOS=1
+  else
+    rm "$destino.nuevo"
+    echo "==> Hook ya al día: $destino"
+  fi
+}
+
+# ============================================================================
+# 1. Hook (UserPromptSubmit): rama git automática en cada /opsx:propose
+# ============================================================================
+instalar_hook .claude/hooks/rama-propose.sh << 'EOF'
 #!/usr/bin/env bash
 # Hook UserPromptSubmit: crea una rama por cada /opsx:propose.
 # Recibe JSON por stdin; usa bun (prerrequisito del proyecto) para parsearlo.
@@ -51,25 +63,97 @@ esac
 exit 0
 EOF
 
-if [ ! -f "$HOOK" ] || ! cmp -s "$HOOK.nuevo" "$HOOK"; then
-  mv "$HOOK.nuevo" "$HOOK"
-  chmod +x "$HOOK"
-  echo "==> Hook actualizado: $HOOK"
+# ============================================================================
+# 2. Hook (UserPromptSubmit): marcar que hay un /opsx:archive en curso
+# ============================================================================
+# El commit no puede hacerse al recibir el prompt (el archive aún no movió
+# los archivos): aquí solo se deja una marca con el id del cambio, y el
+# hook de Stop (paso 3) hace el commit cuando Claude termina.
+instalar_hook .claude/hooks/marcar-archive.sh << 'EOF'
+#!/usr/bin/env bash
+# Hook UserPromptSubmit: marca que se pidió /opsx:archive para que el hook
+# de Stop haga el commit al terminar.
+set -euo pipefail
+
+PROMPT=$(bun -e 'const d=await new Response(Bun.stdin.stream()).text();try{process.stdout.write(JSON.parse(d).prompt??"")}catch{}' 2>/dev/null || true)
+
+case "$PROMPT" in
+  /opsx:archive*)
+    # Id del cambio: argumento del comando o, si no viene, derivado de la rama.
+    ID=$(printf '%s' "$PROMPT" | head -n1 | awk '{print $2}' | tr -cd 'a-zA-Z0-9._-')
+    if [ -z "$ID" ]; then
+      RAMA=$(git branch --show-current 2>/dev/null || true)
+      case "$RAMA" in
+        propose/*) ID=$(printf '%s' "$RAMA" | sed -E 's|^propose/||; s|-[0-9]{8}-[0-9]{6}$||');;
+      esac
+    fi
+    [ -z "$ID" ] && ID="cambio"
+    printf '%s' "$ID" > .claude/.archive-pendiente
+    echo "Hook configurado: al terminar este archive se hará commit automático del cambio '$ID'. No hagas commits manuales."
+    ;;
+esac
+exit 0
+EOF
+
+# ============================================================================
+# 3. Hook (Stop): commit automático cuando el archive terminó
+# ============================================================================
+instalar_hook .claude/hooks/commit-archive.sh << 'EOF'
+#!/usr/bin/env bash
+# Hook Stop: si hay un archive marcado como pendiente y ya se completó,
+# hace git add -A + commit con mensaje relacionado al cambio.
+set -euo pipefail
+
+MARCA=.claude/.archive-pendiente
+[ -f "$MARCA" ] || exit 0
+
+ID=$(cat "$MARCA")
+
+# ¿El archive realmente terminó? El cambio ya no debe estar activo.
+if [ -d "openspec/changes/$ID" ]; then
+  # Sigue activo: el archive no terminó en este turno; se mantiene la marca.
+  exit 0
+fi
+
+rm -f "$MARCA"
+git add -A
+if ! git diff --cached --quiet; then
+  RAMA=$(git branch --show-current 2>/dev/null || echo "?")
+  git commit -q -m "Cambio '$ID' completado y archivado (rama $RAMA)"
+fi
+exit 0
+EOF
+
+# ============================================================================
+# 4. .gitignore: la marca temporal no se versiona
+# ============================================================================
+if ! grep -qxF '.claude/.archive-pendiente' .gitignore 2>/dev/null; then
+  echo '.claude/.archive-pendiente' >> .gitignore
+  echo "==> .gitignore: agregado .claude/.archive-pendiente"
   CAMBIOS=1
 else
-  rm "$HOOK.nuevo"
-  echo "==> Hook ya al día: $HOOK"
+  echo "==> .gitignore ya al día"
 fi
 
 # ============================================================================
-# 2. Registrar el hook en .claude/settings.json (merge, no sobrescritura)
+# 5. Registrar los hooks en .claude/settings.json (merge, no sobrescritura)
 # ============================================================================
 SETTINGS=.claude/settings.json
 export SETTINGS
 RESULTADO=$(bun -e '
 const fs = require("fs");
 const ruta = process.env.SETTINGS;
-const comando = "bash .claude/hooks/rama-propose.sh";
+
+// evento → comandos que deben estar registrados
+const requeridos = {
+  UserPromptSubmit: [
+    "bash .claude/hooks/rama-propose.sh",
+    "bash .claude/hooks/marcar-archive.sh",
+  ],
+  Stop: [
+    "bash .claude/hooks/commit-archive.sh",
+  ],
+};
 
 let cfg = {};
 if (fs.existsSync(ruta)) {
@@ -78,33 +162,41 @@ if (fs.existsSync(ruta)) {
 }
 
 cfg.hooks ??= {};
-cfg.hooks.UserPromptSubmit ??= [];
+let agregados = 0;
 
-const yaExiste = cfg.hooks.UserPromptSubmit.some(grupo =>
-  (grupo.hooks ?? []).some(h => h.command === comando)
-);
+for (const [evento, comandos] of Object.entries(requeridos)) {
+  cfg.hooks[evento] ??= [];
+  for (const comando of comandos) {
+    const existe = cfg.hooks[evento].some(grupo =>
+      (grupo.hooks ?? []).some(h => h.command === comando)
+    );
+    if (!existe) {
+      cfg.hooks[evento].push({ hooks: [{ type: "command", command: comando }] });
+      agregados++;
+    }
+  }
+}
 
-if (yaExiste) {
-  console.log("sin-cambios");
-} else {
-  cfg.hooks.UserPromptSubmit.push({ hooks: [{ type: "command", command: comando }] });
+if (agregados > 0) {
   fs.writeFileSync(ruta, JSON.stringify(cfg, null, 2) + "\n");
-  console.log("actualizado");
+  console.log("actualizado:" + agregados);
+} else {
+  console.log("sin-cambios");
 }
 ')
 
 case "$RESULTADO" in
-  actualizado)  echo "==> Hook registrado en $SETTINGS"; CAMBIOS=1;;
-  sin-cambios)  echo "==> $SETTINGS ya tenía el hook registrado";;
-  *)            echo "$RESULTADO"; exit 1;;
+  actualizado:*) echo "==> Hooks registrados en $SETTINGS (${RESULTADO#actualizado:} nuevos)"; CAMBIOS=1;;
+  sin-cambios)   echo "==> $SETTINGS ya tenía todos los hooks registrados";;
+  *)             echo "$RESULTADO"; exit 1;;
 esac
 
 # ============================================================================
 # Commit de la actualización
 # ============================================================================
 if [ "$CAMBIOS" -eq 1 ]; then
-  git add .claude/hooks/rama-propose.sh "$SETTINGS"
-  git commit -q -m "Hook: rama git automática (propose/<id>-<timestamp>) en cada /opsx:propose"
+  git add .claude/hooks .claude/settings.json .gitignore
+  git commit -q -m "Hooks: rama automática en propose y commit automático al archivar"
   echo ""
   echo "==> Commit creado. Si el repo ya está en GitHub: git push"
 else
@@ -113,6 +205,7 @@ else
 fi
 
 echo ""
-echo "Prueba rápida del hook (sin Claude Code):"
+echo "Prueba rápida sin Claude Code (desde la raíz del repo):"
 echo "  printf '%s' '{\"prompt\":\"/opsx:propose prueba\"}' | bash .claude/hooks/rama-propose.sh"
-echo "  git branch   # debe aparecer propose/prueba-<timestamp>"
+echo "  touch archivo-de-prueba && printf '%s' '{\"prompt\":\"/opsx:archive prueba\"}' | bash .claude/hooks/marcar-archive.sh"
+echo "  echo '{}' | bash .claude/hooks/commit-archive.sh && git log -1 --oneline"
