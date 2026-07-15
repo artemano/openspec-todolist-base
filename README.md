@@ -1,6 +1,4 @@
-# openspec-todolist-base
-
-Repo base del tutorial **OpenSpec en acción: un TodoList paso a paso**.
+# Repo base para **OpenSpec en Acción**
 
 ## Arranque
 
