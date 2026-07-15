@@ -8,6 +8,24 @@
             "command": "bash .claude/hooks/rama-propose.sh"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/marcar-archive.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/commit-archive.sh"
+          }
+        ]
       }
     ]
   }
