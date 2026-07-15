@@ -1,0 +1,13 @@
+{
+  "name": "openspec-todolist-base",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -n server,app -c blue,green \"bun run dev:server\" \"bun run dev:app\"",
+    "dev:server": "bun --watch server/index.ts",
+    "dev:app": "cd app && bunx vite"
+  },
+  "workspaces": ["app"],
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}
